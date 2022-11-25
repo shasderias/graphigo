@@ -1,92 +1,235 @@
 package graphigo_test
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
+	"fmt"
+	"strconv"
+	"testing"
 	"time"
 
-	"gopkg.in/fgrosse/graphigo.v2"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+
+	"github.com/shasderias/graphigo"
 )
 
-var _ = Describe("Graphigo", func() {
-	var (
-		c    *graphigo.Client
-		conn *connMock
-	)
+var specimenMetric = graphigo.Metric{"abc", 123.03, time.Unix(1234567890, 0)}
 
-	BeforeEach(func() {
-		conn = newConnectionMock()
-		c = &graphigo.Client{}
-		c.Connection = conn
+var specimenMetrics = []graphigo.Metric{
+	{"abc", 123.03, time.Unix(1234567890, 0)},
+	{"abc", "123.03", time.Unix(1234567891, 0)},
+	{"abc", 123, time.Unix(1234567892, 0)},
+}
+var specimenMetrics2 = []graphigo.Metric{
+	{"abc", 123.02, time.Unix(1234567890, 0)},
+	{"abc", "123.02", time.Unix(1234567891, 0)},
+	{"abc", 122, time.Unix(1234567892, 0)},
+}
+
+func TestSanity(t *testing.T) {
+	server := graphigo.NewMockServer(t, "2003")
+
+	client, err := graphigo.NewClient("localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Send(specimenMetrics...); err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if server.HasErrors() {
+		t.Fatal(server.Errors())
+	}
+
+	recvMetrics := server.Metrics()
+	if len(recvMetrics) != len(specimenMetrics) {
+		t.Fatalf("got %d metrics; want %d", len(recvMetrics), len(specimenMetrics))
+	}
+
+	if diff := cmp.Diff(specimenMetrics, recvMetrics, metricCmpOptions()...); diff != "" {
+		t.Fatal(diff)
+	}
+	// safety guard to make sure metricCmpOptions is correct
+	if diff := cmp.Diff(specimenMetrics2, recvMetrics, metricCmpOptions()...); diff == "" {
+		t.Fatal("expected diff")
+	}
+}
+
+func TestNonDefaultPort(t *testing.T) {
+	server := graphigo.NewMockServer(t, "2004")
+
+	client, err := graphigo.NewClient("localhost:2004")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Send(specimenMetric); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if server.HasErrors() {
+		t.Fatal(server.Errors())
+	}
+}
+
+func TestPrefix(t *testing.T) {
+	server := graphigo.NewMockServer(t, "2005")
+
+	clientWithNoDotSuffix, err := graphigo.NewClient("localhost:2005", func(c *graphigo.Config) {
+		c.Prefix = "prefix"
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clientWithNoDotSuffix.Send(specimenMetric); err != nil {
+		t.Fatal(err)
+	}
+	clientWithNoDotSuffix.Close()
 
-	Describe("Close", func() {
-		It("should close the connection", func() {
-			Expect(conn.IsClosed).NotTo(BeTrue())
-			c.Close()
-			Expect(conn.IsClosed).To(BeTrue())
-		})
+	clientWithDotSuffix, err := graphigo.NewClient("localhost:2005", func(c *graphigo.Config) {
+		c.Prefix = "prefix."
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clientWithDotSuffix.Send(specimenMetric); err != nil {
+		t.Fatal(err)
+	}
+	clientWithDotSuffix.Close()
 
-	Describe("Send", func() {
-		It("should send string values to graphite", func() {
-			Expect(c.Send(graphigo.Metric{Name: "test_metric", Value: "42"})).To(Succeed())
-			Expect(conn.SentMetrics).To(HaveLen(1))
-			Expect(conn.SentMetrics[0].Name).To(Equal("test_metric"))
-			Expect(conn.SentMetrics[0].Value).To(Equal("42"))
-			Expect(conn.SentMetrics[0].Timestamp).To(BeTemporally("~", time.Now().UTC(), 1*time.Second))
-		})
+	time.Sleep(100 * time.Millisecond)
 
-		It("should send integer values to graphite", func() {
-			Expect(c.Send(graphigo.Metric{Name: "test_metric", Value: 7})).To(Succeed())
-			Expect(conn.SentMetrics).To(HaveLen(1))
-			Expect(conn.SentMetrics[0].Name).To(Equal("test_metric"))
-			Expect(conn.SentMetrics[0].Value).To(Equal("7"))
-			Expect(conn.SentMetrics[0].Timestamp).To(BeTemporally("~", time.Now().UTC(), 1*time.Second))
-		})
+	if server.HasErrors() {
+		t.Fatal(server.Errors())
+	}
 
-		It("should send float values to graphite", func() {
-			Expect(c.Send(graphigo.Metric{Name: "test_metric", Value: 3.14159265359})).To(Succeed())
-			Expect(conn.SentMetrics).To(HaveLen(1))
-			Expect(conn.SentMetrics[0].Name).To(Equal("test_metric"))
-			Expect(conn.SentMetrics[0].Value).To(Equal("3.14159265359"))
-			Expect(conn.SentMetrics[0].Timestamp).To(BeTemporally("~", time.Now().UTC(), 1*time.Second))
-		})
+	recvMetrics := server.Metrics()
+	if len(recvMetrics) != 2 {
+		t.Fatalf("got %d metrics; want %d", len(recvMetrics), 2)
+	}
 
-		Context("with prefix", func() {
-			BeforeEach(func() {
-				c.Prefix = "foo_bar.baz"
-			})
+	if recvMetrics[0].Path != "prefix.abc" {
+		t.Fatalf("got %s; want %s", recvMetrics[0].Path, "prefix.abc")
+	}
+	if diff := cmp.Diff(specimenMetric, recvMetrics[0],
+		cmpopts.EquateApproxTime(1*time.Second), cmpopts.IgnoreFields(graphigo.Metric{}, "Path")); diff != "" {
+		t.Fatal(diff)
+	}
+	if recvMetrics[1].Path != "prefix.abc" {
+		t.Fatalf("got %s; want %s", recvMetrics[1].Path, "prefix.abc")
+	}
+	if diff := cmp.Diff(specimenMetric, recvMetrics[1],
+		cmpopts.EquateApproxTime(1*time.Second), cmpopts.IgnoreFields(graphigo.Metric{}, "Path")); diff != "" {
+		t.Fatal(diff)
+	}
+	if specimenMetric.Path != "abc" {
+		t.Fatalf("setting prefix should not alter slice passed to Send(), got %s; want %s", specimenMetric.Path, "abc")
+	}
+}
 
-			It("should set the correct metric name", func() {
-				Expect(c.Send(graphigo.Metric{Name: "test_metric", Value: 7})).To(Succeed())
-				Expect(conn.SentMetrics).To(HaveLen(1))
-				Expect(conn.SentMetrics[0].Name).To(Equal("foo_bar.baz.test_metric"))
-			})
+func TestEmpty(t *testing.T) {
+	server := graphigo.NewMockServer(t, "2006")
 
-			It("should not leak changes to the given metric", func() {
-				metric := graphigo.Metric{Name: "test_metric", Value: 7}
-				Expect(c.Send(metric)).To(Succeed())
-				Expect(metric.Name).To(Equal("test_metric"))
-			})
-		})
-	})
+	client, err := graphigo.NewClient("localhost:2006")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Send(); err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
 
-	Describe("SendAll", func() {
-		It("should send multiple values in one write command", func() {
-			metrics := []graphigo.Metric{
-				{Name: "test_metric_a", Value: "1", Timestamp: time.Now().Add(-1 * time.Hour)},
-				{Name: "test_metric_b", Value: "2", Timestamp: time.Now().Add(-30 * time.Minute)},
-				{Name: "test_metric_c", Value: "3", Timestamp: time.Now()},
+	time.Sleep(100 * time.Millisecond)
+
+	if server.HasErrors() {
+		t.Fatal(server.Errors())
+	}
+	if metrics := server.Metrics(); len(metrics) > 0 {
+		t.Fatal("expected no metrics")
+	}
+}
+
+func TestInvalidMetric(t *testing.T) {
+	_ = graphigo.NewMockServer(t, "2007")
+
+	client, err := graphigo.NewClient("localhost:2007")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Send(graphigo.Metric{}); err == nil {
+		t.Fatal("expected error")
+	}
+	if err := client.Send(graphigo.Metric{Value: 3.14, Timestamp: time.Now()}); err == nil {
+		t.Fatal("expected error")
+	}
+	if err := client.Send(graphigo.Metric{Path: "apple", Value: 3.14}); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSendAfterClose(t *testing.T) {
+	server := graphigo.NewMockServer(t, "2008")
+
+	client, err := graphigo.NewClient("localhost:2008")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Send(specimenMetric); err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+	if err := client.Send(specimenMetric); err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if server.HasErrors() {
+		t.Fatal(server.Errors())
+	}
+
+	metrics := server.Metrics()
+	if len(metrics) != 2 {
+		t.Fatalf("got %d; want %d", len(metrics), 2)
+	}
+	if diff := cmp.Diff(specimenMetric, metrics[0], metricCmpOptions()...); diff != "" {
+		t.Fatal(diff)
+	}
+	if diff := cmp.Diff(specimenMetric, metrics[1], metricCmpOptions()...); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func metricCmpOptions() []cmp.Option {
+	return []cmp.Option{
+		cmpopts.EquateApproxTime(time.Second),
+		cmp.FilterPath(func(p cmp.Path) bool {
+			return p[len(p)-1].String() == ".Value"
+		}, cmp.Transformer("Metric.Value", func(v any) float64 {
+			switch tv := v.(type) {
+			case int:
+				return float64(tv)
+			case float64:
+				return tv
+			case string:
+				f, err := strconv.ParseFloat(tv, 64)
+				if err != nil {
+					panic(err)
+				}
+				return f
+			default:
+				f, err := strconv.ParseFloat(fmt.Sprintf("%v", tv), 64)
+				if err != nil {
+					panic(err)
+				}
+				return f
 			}
-			Expect(c.SendAll(metrics)).To(Succeed())
-
-			for i, sentMetric := range conn.SentMetrics {
-				Expect(sentMetric.Name).To(Equal(metrics[i].Name))
-				Expect(sentMetric.Value).To(Equal(metrics[i].Value))
-				Expect(sentMetric.Timestamp).To(BeTemporally("~", metrics[i].Timestamp, 1*time.Second))
-			}
-		})
-	})
-})
+		})),
+	}
+}

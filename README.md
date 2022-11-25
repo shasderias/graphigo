@@ -1,30 +1,13 @@
-Graphigo
+GraphiGo
 ========
 
-[![Build Status](https://travis-ci.org/fgrosse/graphigo.svg?branch=master)](https://travis-ci.org/fgrosse/graphigo)
-[![GoDoc](https://godoc.org/gopkg.in/fgrosse/graphigo.v2?status.svg)](https://godoc.org/gopkg.in/fgrosse/graphigo.v2)
-
-A simple go client for the [graphite monitoring tool][1].
-
-## Features
-
-- simple and clean API
-- send a whole bunch of metrics and send them all with one TCP call
-- supports timeouts
-- supports prefixes
-- sane defaults
-- all client functions are automatically noops if the client is `nil`
-- good test coverage and documentation
-- stable API via gopkg.in
+A simple go client for [graphite][1]. Rewrite/fork of https://github.com/fgrosse/graphigo.
 
 ## Installation
 
-Use `go get` to install graphigo:
 ```
-go get gopkg.in/fgrosse/graphigo.v2
+go get github.com/shasderias/graphigo
 ```
-
-No additional dependencies are required.
 
 ## Usage
 
@@ -33,60 +16,54 @@ package main
 
 import (
 	"time"
-	"gopkg.in/fgrosse/graphigo.v2"
+
+	"github.com/shasderias/graphigo"
 )
 
 func main() {
-    c := graphigo.Client{
-    	// If you omit the entire address localhost:2004 will be assumed
-    	// Just omitting the port is also valid and wil use the default port
-		Address: "graphite.your.org:2004",
+	// The port number can be omitted if connecting to the default port (2003).
+	client, err := graphigo.NewClient("localhost:2003", func(c *graphigo.Config) {
+		// These are the default values. If you do not want to change them, the second argument
+		// can be omitted, i.e. graphigo.NewClient("localhost") is sufficient.
 
-		// set a custom timeout (seconds) for the graphite connection
-		// if timeout = 0 then the graphigo.DefaultTimeout = 5 seconds is used
-		// Setting Timeout to graphite.TimeoutDisabled (-1) disables the timeout
-		Timeout: 42,
+		c.DialTimeout = 5 * time.Second
 
-		// set a custom prefix for all recorded metrics of this client (optional)
-		Prefix: "foo.bar.baz",
-	}
+		c.WriteTimeout = 5 * time.Second
 
-	if err := c.Connect(); err != nil {
-		panic(err) // do proper error handling
-	}
-
-	// close the TCP connection properly if you don't need it anymore
-	defer c.Close()
-
-	// capture and send values using a single line
-	c.SendValue("hello.graphite.world", 42)
-
-	// capture a metric and send it any time later. You can use any type as value
-	// The next line could also be simplified with graphigo.CaptureMetric 
-	metric := graphigo.Metric{Name: "test", Value: 3.14, Timestamp: time.Now()}
-	defer c.Send(metric)
-
-	// create a whole bunch of metrics and send them all with one TCP call
-	c.SendAll([]graphigo.Metric{
-		{Name: "shut", Value: 1},
-		{Name: "up", Value: 2},
-		{Name: "and", Value: 3},
-		{Name: "take", Value: 4},
-		{Name: "my", Value: 5},
-		{Name: "money", Value: 6},
+		// If Prefix is not empty, it will be prepended to all metrics sent.
+		// A dot separator automatically added if required.
+		c.Prefix = ""
 	})
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close()
+
+	// Send automatically establishes a connection if necessary. There is no Connect().
+	// All fields in Metric are required, Timestamp cannot be zero.
+	if err := client.Send(graphigo.Metric{Path: "path", Value: 3.14, Timestamp: time.Now()}); err != nil {
+		panic(err)
+	}
+
+	// Send is variadic.
+	if err := client.Send(
+		graphigo.Metric{"over", 3.14, time.Now()},
+		graphigo.Metric{"the", 137.035, time.Now()},
+		graphigo.Metric{"hills", 6.626, time.Now()},
+	); err != nil {
+		panic(err)
+	}
+	if err := client.Send(
+		[]graphigo.Metric{
+			{"and", 299792458, time.Now()},
+			{"far", 8.854, time.Now()},
+			{"away", 1.602, time.Now()},
+		}...,
+	); err != nil {
+		panic(err)
+	}
 }
+
 ```
 
-## Alternatives
-
-- https://github.com/marpaia/graphite-golang
-- https://github.com/ohlol/graphite-go
-
-## Contributing
-
-Any contributions are always welcome (use pull requests).
-Please keep in mind that I might not always be able to respond immediately but I usually try to react within the week ☺.
-
 [1]: http://graphite.readthedocs.org/en/latest/overview.html
-[2]: https://godoc.org/gopkg.in/fgrosse/graphigo.v2

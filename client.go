@@ -5,163 +5,145 @@ package graphigo
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
-// Client is a simple TCP client for the graphite monitoring tool.
-type Client struct {
-	// Address is used when connecting to the graphite server. Use address:port notation.
-	// If Address is empty then any call to Connect will try to connect to a local
-	// graphite instance. If you just omit the :port part the DefaultGraphitePort
-	// constant will be used instead.
-	Address string
-
-	// Timeout is the maximum duration that the client will wait for a response from the server.
-	// If timeout is zero then the DefaultTimeout is used.
-	// Setting Timeout to -1 disables the timeout.
-	Timeout time.Duration
-
-	// Prefix is prepended to all metric names (separated from original name by a dot).
-	// If Prefix is empty this does nothing.
-	Prefix string
-
-	// Connection is used to communicate with the graphite client.
-	// You would normally not interfere with this but this can be handy for testing.
-	Connection io.WriteCloser
-}
-
 const (
-	// DefaultTimeout is the timeout that is applied when connecting to a graphite server.
-	// It is used if no explicit timeout has been configured on a client.
-	DefaultTimeout = 5
+	// DefaultDialTimeout is used when connecting to a graphite server.
+	DefaultDialTimeout = 5 * time.Second
 
-	// DefaultGraphitePort is the port a graphite server runs on by default.
-	// This port is used if you don't supply any port in the Address of the client.
-	DefaultGraphitePort = "2004"
+	// DefaultWriteTimeout is used when sending metrics.
+	DefaultWriteTimeout = 5 * time.Second
 
-	// TimeoutDisabled is used to disable the client timeout entirely.
-	TimeoutDisabled = -1
+	// DefaultGraphitePort is used when no port is specified in the address.
+	DefaultGraphitePort = "2003"
 )
 
-// Connect attempts to establish the connection to the graphite server.
-// This will return an error if a TCP connection can not or has already been established.
-//
-// If c is nil this will do nothing (noop)
-func (c *Client) Connect() (err error) {
-	if c == nil {
-		return nil
-	}
+type Config struct {
+	// DialTimeout is used when connecting to the graphite server.
+	DialTimeout time.Duration
 
-	if c.Connection != nil {
-		return fmt.Errorf("Graphigo is already connected. Call Disconnect first if you want to reconnect")
-	}
+	// WriteTimeout is used when sending metrics using Send().
+	WriteTimeout time.Duration
 
-	if c.Timeout == 0 {
-		c.Timeout = DefaultTimeout * time.Second
-	}
-
-	timeout := c.Timeout
-	if c.Timeout == -1 {
-		timeout = 0
-	}
-
-	if c.Address == "" {
-		c.Address = "localhost"
-	}
-
-	if !strings.Contains(c.Address, ":") {
-		c.Address = c.Address + ":" + DefaultGraphitePort
-	}
-
-	c.Connection, err = net.DialTimeout("tcp", c.Address, timeout)
-	return err
+	// Prefix is prepended to all metric names. If not present, a dot is automatically appended.
+	Prefix string
 }
 
-// Close implements the io.Closer interface by closing the clients Connection.
-// If c is nil this will do nothing (noop)
-func (c *Client) Close() error {
-	if c == nil {
-		return nil
+func NewClient(address string, configFns ...func(c *Config)) (*Client, error) {
+	config := Config{
+		DialTimeout:  DefaultDialTimeout,
+		WriteTimeout: DefaultWriteTimeout,
 	}
 
-	err := c.Connection.Close()
-	c.Connection = nil
-	return err
+	for _, fn := range configFns {
+		fn(&config)
+	}
+
+	host, port, err := net.SplitHostPort(address)
+	if err != nil && strings.Contains(err.Error(), "missing port") {
+		host = address
+		port = DefaultGraphitePort
+	} else if err != nil {
+		return nil, fmt.Errorf("error parsing address: %v", err.Error())
+	}
+
+	prefix := config.Prefix
+	if prefix != "" && !strings.HasSuffix(prefix, ".") {
+		prefix += "."
+	}
+
+	return &Client{
+		host: host, port: port,
+
+		dialTimeout:  config.DialTimeout,
+		writeTimeout: config.WriteTimeout,
+
+		prefix: prefix,
+	}, nil
 }
 
-// SendValue creates a new graphigo.Metric with the metric timestamp set to now and sends it to graphite.
-//
-// Use `Send(Metric)` if you want to split metric recording and sending.
-// This will return an error if the client has not yet been connected or the metric name is empty.
-//
-// If c is nil this will do nothing (noop)
-func (c *Client) SendValue(name string, value interface{}) error {
-	if c == nil {
-		return nil
-	}
+// Client is a simple TCP client for the graphite monitoring tool.
+type Client struct {
+	host, port string
 
-	return c.Send(Metric{
-		Name:  name,
-		Value: value,
-	})
+	mut sync.Mutex
+
+	dialTimeout  time.Duration
+	writeTimeout time.Duration
+	prefix       string
+	conn         net.Conn
 }
 
-// Send sends a graphigo.Metric to graphite.
-// This can be used to send a metric which has been recorded earlier.
-//
-// Use `SendValue` if you want to create and send a metric in one step.
-// Use `SendAll` if you want to send multiple metrics at once.
-// This will return an error if the client has not yet been connected or the metric name is empty.
-//
-// If c is nil this will do nothing (noop)
-func (c *Client) Send(m Metric) error {
-	if c == nil {
-		return nil
-	}
+// Send sends metrics to the graphite server. Send automatically establishes a connection if necessary.
+func (c *Client) Send(metrics ...Metric) (err error) {
+	c.mut.Lock()
+	defer c.mut.Unlock()
 
-	return c.SendAll([]Metric{m})
-}
-
-// SendAll sends multiple graphigo.Metric to graphite.
-// This can be used to send multiple metrics that have been recorded earlier.
-//
-// Use `Send` if you want to send a single metric.
-// If the client has not yet been connected or if any of the metrics has an
-// empty name this function will return an error.
-//
-// If c is nil this will do nothing (noop)
-func (c *Client) SendAll(metrics []Metric) (err error) {
-	if c == nil {
-		return nil
-	}
-
-	if c.Connection == nil {
-		return fmt.Errorf("Graphigo is not connected yet. Did you forget to call Connect() ?")
-	}
-
-	buffer := &bytes.Buffer{}
-	for _, metric := range metrics {
-		if metric.Name == "" {
-			return fmt.Errorf("Could not send graphite metric: no metric name given")
-		}
-
-		if metric.Timestamp.IsZero() {
-			metric.Timestamp = time.Now()
-		}
-
-		if c.Prefix != "" {
-			metric.Name = fmt.Sprintf("%s.%s", c.Prefix, metric.Name)
-		}
-
-		_, err = fmt.Fprintf(buffer, "%s %v %d\n", metric.Name, metric.Value, metric.UnixTimestamp())
+	defer func() {
 		if err != nil {
-			return fmt.Errorf("Could not write metric to send buffer: %s", err.Error())
+			_ = c.close()
+		}
+	}()
+
+	if err := c.connect(); err != nil {
+		return err
+	}
+
+	var buf bytes.Buffer
+	for i := range metrics {
+		if metrics[i].Path == "" {
+			return fmt.Errorf("no path supplied for metrics[%d]: %s", i, metrics[i])
+		}
+		if metrics[i].Timestamp.IsZero() {
+			return fmt.Errorf("timestamp for metrics[%d] is zero: %s", i, metrics[i])
+		}
+		_, err := fmt.Fprintf(&buf, "%s%s %v %d\n", c.prefix, metrics[i].Path, metrics[i].Value, metrics[i].Timestamp.Unix())
+		if err != nil {
+			return fmt.Errorf("error writing metric to buffer: %w", err)
 		}
 	}
 
-	_, err = c.Connection.Write(buffer.Bytes())
+	if err := c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+		return fmt.Errorf("error setting write deadline: %w", err)
+	}
+
+	if _, err := c.conn.Write(buf.Bytes()); err != nil {
+		return fmt.Errorf("error sending metrics: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Client) connect() error {
+	if c.conn != nil {
+		return nil
+	}
+
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(c.host, c.port), c.dialTimeout)
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+	return nil
+}
+
+// Close closes the network connection used by Client. If no connection is established, Close is a no-op.
+func (c *Client) Close() error {
+	c.mut.Lock()
+	defer c.mut.Unlock()
+
+	return c.close()
+}
+
+func (c *Client) close() error {
+	if c.conn == nil {
+		return nil
+	}
+	err := c.conn.Close()
+	c.conn = nil
 	return err
 }
